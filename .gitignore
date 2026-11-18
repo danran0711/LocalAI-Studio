@@ -221,3 +221,122 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# 1. Python 基础环境与编译缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 虚拟环境 (venv, conda 等)
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+conda-meta/
+
+# 包管理与打包构建产物
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# 2. 敏感信息与本地配置 
+
+# 包含 API Key、数据库密码等环境变量的文件
+.env
+.env.local
+.env.*.local
+*.env
+
+# 本地专属配置文件
+local_settings.py
+*.local
+
+# 3. AI 大模型与数据处理专属
+# 模型权重与二进制文件 (防止仓库体积爆炸)
+*.pth
+*.pt
+*.bin
+*.safetensors
+*.onnx
+*.h5
+*.pb
+models/
+checkpoints/
+weights/
+
+# 模型与依赖下载缓存
+.cache/
+.huggingface/
+.npm/
+
+# PDF识别与数据处理输出目录 (按需调整)
+output/
+outputs/
+results/
+data/processed/
+data/raw/
+temp/
+tmp/
+*.csv.tmp
+*.json.tmp
+
+# 4. 测试、日志与临时文件
+# 日志文件
+*.log
+logs/
+
+# 单元测试与代码覆盖率报告
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py.cover
+.hypothesis/
+.pytest_cache/
+
+# Jupyter Notebook 检查点
+.ipynb_checkpoints/
+
+# 编辑器临时文件
+*.swp
+*.swo
+*~
+
+# 5. IDE 与操作系统垃圾文件
+# PyCharm / IntelliJ
+.idea/
+*.iml
+*.iws
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# 操作系统 (macOS / Windows)
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
