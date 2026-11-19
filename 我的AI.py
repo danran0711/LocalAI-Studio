@@ -4,6 +4,9 @@
 ========================================
 运行：python 我的AI.py     浏览器打开 http://127.0.0.1:5000
 环境变量：AI_HOST AI_PORT AI_EMB AI_LLM AI_NO_WEB
+
+注意：faiss 的 C++ 写盘函数在 Windows 上打不开含中文的绝对路径，
+      索引统一用「切到索引目录 + 相对路径」的方式保存/读取，见 _save_vectorstore。
 """
 import os
 import re
@@ -86,40 +89,41 @@ DEPS = [
     ("faiss", "faiss-cpu"),
     ("pdfplumber", "pdfplumber"),
     ("docx", "python-docx"),
+    #.doc不支持
     ("requests", "requests"),
     ("flask", "flask"),
 ]
 
 
-# def ensure_deps():
-#     missing = []
-#     for mod, pkg in DEPS:
-#         try:
-#             importlib.import_module(mod)
-#         except Exception:
-#             missing.append(pkg)
-#     # 联网搜索：优先新的 ddgs 包，其次老的 duckduckgo-search
-#     if not NO_WEB:
-#         try:
-#             importlib.import_module("ddgs")
-#         except Exception:
-#             try:
-#                 importlib.import_module("duckduckgo_search")
-#             except Exception:
-#                 missing.append("ddgs")
-#     if not missing:
-#         return
-#     pkgs = sorted(set(missing))
-#     log(f"  缺少 {len(pkgs)} 个依赖，正在安装：{' '.join(pkgs)}")
-#     cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "-q", *pkgs]
-#     try:
-#         subprocess.check_call(cmd)
-#     except Exception:
-#         log("  普通安装失败，尝试 --user 安装 ...")
-#         try:
-#             subprocess.check_call(cmd + ["--user"])
-#         except Exception as e:
-#             die("依赖安装失败", f"请手动执行：pip install {' '.join(pkgs)}  ({e})")
+def ensure_deps():
+    missing = []
+    for mod, pkg in DEPS:
+        try:
+            importlib.import_module(mod)
+        except Exception:
+            missing.append(pkg)
+    # 联网搜索：优先新的 ddgs 包，其次老的 duckduckgo-search
+    if not NO_WEB:
+        try:
+            importlib.import_module("ddgs")
+        except Exception:
+            try:
+                importlib.import_module("duckduckgo_search")
+            except Exception:
+                missing.append("ddgs")
+    if not missing:
+        return
+    pkgs = sorted(set(missing))
+    log(f"  缺少 {len(pkgs)} 个依赖，正在安装：{' '.join(pkgs)}")
+    cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "-q", *pkgs]
+    try:
+        subprocess.check_call(cmd)
+    except Exception:
+        log("  普通安装失败，尝试 --user 安装 ...")
+        try:
+            subprocess.check_call(cmd + ["--user"])
+        except Exception as e:
+            die("依赖安装失败", f"请手动执行：pip install {' '.join(pkgs)}  ({e})")
 
 
 # ---------------------------------------------------------------- Ollama
@@ -201,29 +205,256 @@ def decode_bytes(raw):
     return raw.decode("utf-8", errors="replace")
 
 
+def _read_docx(path):
+    from docx import Document
+    doc = Document(path)
+    parts = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
+    for table in doc.tables:
+        for row in table.rows:
+            cells = [c.text.strip() for c in row.cells]
+            if any(cells):
+                parts.append(" | ".join(cells))
+    return clean_text("\n".join(parts))
+
+
+# ---------------------------------------------------------------- PDF 解析
+# 同一个 PDF，不同解析引擎的结果可能天差地别：pdfplumber 遇到 CID 子集字体、
+# 特殊编码时会吐出一堆乱码；PyMuPDF（pdf2docx 底层用的就是它）往往能正确还原。
+# 所以先跑 pdfplumber，质量不合格再换 PyMuPDF，最后才是"疑似扫描件"。
+def _char_readable(ch):
+    o = ord(ch)
+    return (
+        ch in "\n\t "
+        or 0x20 <= o <= 0x7E                  # ASCII 可打印
+        or 0x4E00 <= o <= 0x9FFF              # 常用汉字
+        or 0x3400 <= o <= 0x4DBF              # 扩展 A
+        or 0x3000 <= o <= 0x303F              # 中文标点
+        or 0xFF00 <= o <= 0xFFEF              # 全角字符
+        or 0x2010 <= o <= 0x2027              # 常见英文标点
+        or 0x00B0 <= o <= 0x00FF              # 度/乘号等
+    )
+
+
+def text_quality(text):
+    """0~1，越高越干净。乱码的典型特征是私用区字符(U+E000+)和替换符(U+FFFD)。"""
+    s = (text or "").strip()
+    if not s:
+        return 0.0
+    total = len(s)
+    readable = sum(1 for ch in s if _char_readable(ch))
+    broken = sum(1 for ch in s if ch == "\ufffd" or 0xE000 <= ord(ch) <= 0xF8FF)
+    return max(0.0, (readable - broken * 2) / total)
+
+
+def _pdf_text_pdfplumber(path):
+    import pdfplumber
+    parts = []
+    with pdfplumber.open(path) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text()
+            if t:
+                parts.append(t)
+    return "\n".join(parts)
+
+
+def _pdf_text_pymupdf(path):
+    import pymupdf
+    parts = []
+    with pymupdf.open(path) as doc:
+        for page in doc:
+            parts.append(page.get_text("text", sort=True))
+    return "\n".join(parts)
+
+
+def _sibling_docx(pdf_path):
+    """PDF 旁边有没有同名的、不比 PDF 旧的 .docx（比如手动转好的版本）。"""
+    cand = os.path.splitext(pdf_path)[0] + ".docx"
+    if not os.path.exists(cand):
+        return None
+    try:
+        if os.path.getmtime(cand) + 1 < os.path.getmtime(pdf_path):
+            return None          # docx 比 PDF 旧，可能不是同一版
+    except OSError:
+        return None
+    return cand
+
+
+# ---------------------------------------------------------------- OCR
+# 扫描件没有文字层，只能靠 OCR。后端优先级：
+#   rapidocr（onnxruntime，CPU 就能跑，稳）→ paddleocr（装了就用，但部分显卡上会算错）
+# 每个后端的结果都会过一遍质量分，乱码会被自动否决并换下一个。
+OCR_ENABLED = os.environ.get("AI_OCR", "1") not in ("0", "false", "False")
+OCR_DPI = int(os.environ.get("AI_OCR_DPI", "200"))
+OCR_MAX_PAGES = int(os.environ.get("AI_OCR_MAX_PAGES", "30"))
+_ocr_engines_cache = {}
+
+
+def _load_rapidocr():
+    from rapidocr_onnxruntime import RapidOCR
+    return RapidOCR()
+
+
+def _read_rapidocr(engine, image):
+    result, _ = engine(image)
+    return [item[1] for item in (result or [])]
+
+
+def _load_paddleocr():
+    from paddleocr import PaddleOCR
+    return PaddleOCR(lang="ch", use_doc_orientation_classify=False,
+                     use_doc_unwarping=False, use_textline_orientation=False)
+
+
+def _read_paddleocr(engine, image):
+    res = engine.predict(image)[0]
+    texts = res.get("rec_texts") if hasattr(res, "get") else None
+    return list(texts or [])
+
+
+def _available_ocr_engines():
+    import importlib.util
+    engines = []
+    if importlib.util.find_spec("rapidocr_onnxruntime"):
+        engines.append(("rapidocr", _load_rapidocr, _read_rapidocr))
+    if importlib.util.find_spec("paddleocr"):
+        engines.append(("paddleocr", _load_paddleocr, _read_paddleocr))
+    # AI_OCR_ENGINE=paddle 可以强制优先用 PaddleOCR（显卡驱动修好之后用得上）
+    pref = os.environ.get("AI_OCR_ENGINE", "").strip().lower()
+    if pref.startswith("paddle"):
+        engines.sort(key=lambda e: 0 if e[0] == "paddleocr" else 1)
+    elif pref.startswith("rapid"):
+        engines.sort(key=lambda e: 0 if e[0] == "rapidocr" else 1)
+    return engines
+
+
+def _render_pdf_pages(path, dpi, max_pages):
+    """把 PDF 每页渲染成 RGB 数组，交给 OCR。"""
+    import numpy as np
+    import pymupdf
+    pages = []
+    with pymupdf.open(path) as doc:
+        for i, page in enumerate(doc):
+            if i >= max_pages:
+                break
+            pix = page.get_pixmap(dpi=dpi)
+            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+            if pix.n == 4:
+                img = img[:, :, :3]
+            elif pix.n == 1:
+                img = np.repeat(img, 3, axis=2)
+            pages.append(img)
+    return pages
+
+
+def ocr_pdf(path):
+    """整份 PDF 走 OCR；返回纯文本，失败返回 None。"""
+    if not OCR_ENABLED:
+        return None
+    name = os.path.basename(path)
+    engines = _available_ocr_engines()
+    if not engines:
+        log("  [警告] 没有可用的 OCR 引擎，装一个即可：pip install rapidocr-onnxruntime")
+        return None
+    try:
+        pages = _render_pdf_pages(path, OCR_DPI, OCR_MAX_PAGES)
+    except Exception as e:
+        log(f"  [警告] {name} 渲染成图片失败：{e}")
+        return None
+    if not pages:
+        return None
+
+    log(f"  [OCR] {name}：{len(pages)} 页 @{OCR_DPI}dpi，开始识别（每页约 1-10 秒）")
+    for engine_name, loader, reader in engines:
+        try:
+            engine = _ocr_engines_cache.get(engine_name) or loader()
+            _ocr_engines_cache[engine_name] = engine
+        except Exception as e:
+            log(f"  [警告] {engine_name} 初始化失败：{e}")
+            continue
+
+        page_texts, failed = [], False
+        for idx, image in enumerate(pages, 1):
+            try:
+                lines = reader(engine, image)
+            except Exception as e:
+                log(f"  [警告] {engine_name} 第 {idx} 页识别失败：{e}")
+                failed = True
+                break
+            page_texts.append("\n".join(lines))
+            if len(pages) > 3:
+                log(f"         · {idx}/{len(pages)} 页")
+        if failed:
+            continue
+
+        joined = "\n".join(page_texts)
+        quality = text_quality(joined)
+        if joined.strip() and quality >= 0.5:
+            log(f"  [OCR] {engine_name} 完成，质量 {quality:.2f}")
+            return clean_text(joined)
+        log(f"  [警告] {engine_name} 识别结果质量过低（{quality:.2f}），换下一个引擎")
+
+    log(f"  [警告] {name} OCR 没能识别出可用文字")
+    return None
+
+
+def read_pdf(path):
+    """PDF → 文本：同名 docx → 双引擎解析 → OCR。"""
+    name = os.path.basename(path)
+
+    # 1) 同名 docx 优先（本地转换过 / 手动用在线工具转好的）
+    sib = _sibling_docx(path)
+    if sib:
+        try:
+            text = _read_docx(sib)
+            if text and text_quality(text) >= 0.7:
+                log(f"  [提示] {name} 旁边有同名 docx，直接读 {os.path.basename(sib)}")
+                return text
+        except Exception as e:
+            log(f"  [警告] 读取 {os.path.basename(sib)} 失败：{e}")
+
+    # 2) 依次尝试两个解析引擎，取第一个质量合格的
+    tried = []
+    best = ("", 0.0, "")
+    for engine, fn in (("pdfplumber", _pdf_text_pdfplumber), ("pymupdf", _pdf_text_pymupdf)):
+        try:
+            text = fn(path)
+        except Exception as e:
+            log(f"  [警告] {name} 用 {engine} 解析失败：{e}")
+            continue
+        quality = text_quality(text)
+        tried.append(f"{engine}={quality:.2f}/{len(text.strip())}字")
+        if quality > best[1]:
+            best = (text, quality, engine)
+        if quality >= 0.85 and len(text.strip()) >= 20:
+            if engine != "pdfplumber":
+                log(f"  [提示] {name} pdfplumber 结果偏差较大，已改用 {engine}")
+            return clean_text(text)
+
+    # 3) 文字层缺失或质量太差 → OCR
+    text, quality, engine = best
+    if len(text.strip()) < 20 or quality < 0.85:
+        if len(text.strip()) < 20:
+            log(f"  [提示] {name} 几乎没有文字层（疑似扫描件），改走 OCR")
+        ocr_text = ocr_pdf(path)
+        if ocr_text and text_quality(ocr_text) >= max(quality, 0.5):
+            return ocr_text
+
+    if len(text.strip()) < 20:
+        log(f"  [警告] {name} 提取不到文字，OCR 也没成功")
+        return None
+    if quality < 0.85:
+        log(f"  [警告] {name} 解析质量偏低（{'，'.join(tried)}），结果可能不完整")
+    return clean_text(text)
+
+
 def read_file(path):
     """返回纯文本；读不了返回 None（下次启动会重试）。"""
     ext = os.path.splitext(path)[1].lower()
     try:
         if ext == ".pdf":
-            import pdfplumber
-            parts = []
-            with pdfplumber.open(path) as pdf:
-                for page in pdf.pages:
-                    t = page.extract_text()
-                    if t:
-                        parts.append(t)
-            return clean_text("\n".join(parts))
+            return read_pdf(path)
         if ext == ".docx":
-            from docx import Document
-            doc = Document(path)
-            parts = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
-            for table in doc.tables:
-                for row in table.rows:
-                    cells = [c.text.strip() for c in row.cells]
-                    if any(cells):
-                        parts.append(" | ".join(cells))
-            return clean_text("\n".join(parts))
+            return _read_docx(path)
         if ext in (".txt", ".md", ".csv"):
             with open(path, "rb") as f:
                 return clean_text(decode_bytes(f.read()))
@@ -301,6 +532,19 @@ def decide(state, sigs):
     return "load", ""
 
 
+def _save_vectorstore(vs):
+    """存盘。faiss 的 C++ 写盘用的是窄字符 fopen，Windows 上打不开含中文的路径
+    （会报 "could not open ... No such file or directory"），所以切到索引目录、
+    用纯 ASCII 的相对路径 "./index.faiss" 来写，绕开编码问题。"""
+    os.makedirs(FAISS_INDEX_DIR, exist_ok=True)
+    cwd = os.getcwd()
+    try:
+        os.chdir(FAISS_INDEX_DIR)
+        vs.save_local(".")
+    finally:
+        os.chdir(cwd)
+
+
 def build_index(embeddings, docs_paths, state, sigs, reason):
     from langchain_text_splitters import RecursiveCharacterTextSplitter
     from langchain_community.vectorstores import FAISS
@@ -334,7 +578,7 @@ def build_index(embeddings, docs_paths, state, sigs, reason):
         except Exception as e:
             die(f"向量化失败：{e}",
                 f"确认 Ollama 里有 {EMB_MODEL}：ollama pull {EMB_MODEL}")
-        vs.save_local(FAISS_INDEX_DIR)
+        _save_vectorstore(vs)
     else:
         log("  没有可入库的资料（放入 pdf/docx/txt/md/csv 后重启即可）")
 
@@ -345,9 +589,14 @@ def build_index(embeddings, docs_paths, state, sigs, reason):
 def load_index(embeddings):
     from langchain_community.vectorstores import FAISS
     from langchain_community.vectorstores.utils import DistanceStrategy
-    return FAISS.load_local(FAISS_INDEX_DIR, embeddings,
-                            allow_dangerous_deserialization=True,
-                            distance_strategy=DistanceStrategy.COSINE)
+    cwd = os.getcwd()
+    try:
+        os.chdir(FAISS_INDEX_DIR)
+        return FAISS.load_local(".", embeddings,
+                                allow_dangerous_deserialization=True,
+                                distance_strategy=DistanceStrategy.COSINE)
+    finally:
+        os.chdir(cwd)
 
 
 def ensure_kb(embeddings):
@@ -477,8 +726,37 @@ def _ddgs_search(query, n):
     return [{"title": r.get("title") or "", "body": r.get("body") or ""} for r in res]
 
 
+# ddgs 内部会按 bing→brave→duckduckgo→google→startpage 逐个重试，每次等满超时，
+# 国内网络下能拖到 30 秒。这里给它一个硬性总预算，超时就直接换 bing 抓页。
+_ddg_state = {"skip_until": 0.0}
+DDG_BUDGET = 4.0          # ddgs 单次总预算（秒）
+DDG_SKIP_SECONDS = 1800   # 连续超时后，本轮运行内先跳过它
+
+
+def _call_with_timeout(fn, timeout, *args):
+    """在守护线程里跑 fn，超时就放弃（线程自行结束，不阻塞退出）。"""
+    import threading
+    import queue
+    box = queue.Queue()
+
+    def worker():
+        try:
+            box.put(("ok", fn(*args)))
+        except Exception as exc:  # noqa: BLE001 - 原样抛给调用方
+            box.put(("err", exc))
+
+    threading.Thread(target=worker, daemon=True).start()
+    try:
+        kind, value = box.get(timeout=timeout)
+    except queue.Empty:
+        raise TimeoutError(f"超过 {timeout:.0f} 秒没有返回")
+    if kind == "err":
+        raise value
+    return value
+
+
 def web_search(question, n=WEB_RESULTS):
-    """先 DDG，失败自动切 bing 网页抓取；结果带 5 分钟缓存。
+    """先 DDG（限时），失败自动切 bing 网页抓取；结果带 5 分钟缓存。
 
     返回 (给模型看的文本, 状态)。状态用于让提示词知道"到底是没有信息，还是搜索坏了"：
       ok       搜到内容
@@ -499,14 +777,26 @@ def web_search(question, n=WEB_RESULTS):
         return cached[1], cached[2]
 
     errors, results = [], None
-    for name, fn in (("ddg", _ddgs_search), ("bing", _bing_html)):
+    for name, fn, budget in (("ddg", _ddgs_search, DDG_BUDGET), ("bing", _bing_html, 12)):
+        if name == "ddg" and time.time() < _ddg_state["skip_until"]:
+            errors.append("ddg: 刚超时过，本轮跳过")
+            continue
+        started = time.time()
         try:
-            results = fn(question, n)
+            results = _call_with_timeout(fn, budget, question, n)
             if results:
                 break
         except Exception as e:
             errors.append(f"{name}: {e}")
-            log(f"  [提示] {name} 搜索不可用，换下一个通道：{e}")
+            if name == "ddg" and isinstance(e, TimeoutError):
+                _ddg_state["skip_until"] = time.time() + DDG_SKIP_SECONDS
+                log(f"  [提示] ddg 超过 {budget:.0f} 秒没响应，接下来半小时直接走 bing")
+            else:
+                log(f"  [提示] {name} 搜索不可用，换下一个通道：{e}")
+        finally:
+            spent = time.time() - started
+            if spent > 3:
+                log(f"  [提示] {name} 通道耗时 {spent:.1f}s")
 
     if not results:
         if errors:
